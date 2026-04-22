@@ -2,7 +2,6 @@ import TelegramBot from "node-telegram-bot-api";
 import { google } from "googleapis";
 import http from "http";
 import url from "url";
-import fs from "fs";
 
 /* =======================
    ENV
@@ -14,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL;
 
 const WEBHOOK_PATH = "/webhook";
-const SHEET_NAME = "DB HOKI";
+const SHEET_NAME = "DB HOKI"; // ganti ke "DB LGN" kalau sheet tab kamu DB LGN
 
 if (!BOT_TOKEN || !SHEET_ID || !GOOGLE_CREDENTIALS || !BASE_URL) {
   console.error("❌ ENV belum lengkap");
@@ -42,46 +41,44 @@ await bot.setWebHook(`${BASE_URL}${WEBHOOK_PATH}`, {
 /* =======================
    HTTP SERVER
 ======================= */
-http.createServer((req, res) => {
-  const parsed = url.parse(req.url, true);
+http
+  .createServer((req, res) => {
+    const parsed = url.parse(req.url, true);
 
-  if (req.method === "POST" && parsed.pathname === WEBHOOK_PATH) {
-    let body = "";
-    req.on("data", c => (body += c));
-    req.on("end", async () => {
-      try {
-        await bot.processUpdate(JSON.parse(body));
-        res.end("OK");
-      } catch (e) {
-        console.error(e);
-        res.end("ERROR");
-      }
-    });
-  } else {
-    res.end("Bot running");
-  }
-}).listen(PORT);
+    if (req.method === "POST" && parsed.pathname === WEBHOOK_PATH) {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", async () => {
+        try {
+          await bot.processUpdate(JSON.parse(body));
+          res.end("OK");
+        } catch (e) {
+          console.error(e);
+          res.end("ERROR");
+        }
+      });
+    } else {
+      res.end("Bot running");
+    }
+  })
+  .listen(PORT);
 
 /* =======================
    UTIL
 ======================= */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const chunk = (arr, parts) => {
-  const size = Math.ceil(arr.length / parts);
-  return Array.from({ length: parts }, (_, i) =>
-    arr.slice(i * size, (i + 1) * size)
-  );
+/**
+ * Split array jadi potongan fix perChunk.
+ * contoh: splitBySize([..1500..], 500) => 3 chunks masing2 500
+ */
+const splitBySize = (arr, perChunk) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += perChunk) {
+    out.push(arr.slice(i, i + perChunk));
+  }
+  return out;
 };
-
-const buildVcard = (nums, label) =>
-  nums.map(
-`BEGIN:VCARD
-VERSION:3.0
-FN:${label}
-TEL;TYPE=CELL:${nums.shift()}
-END:VCARD`
-).join("\n");
 
 /* =======================
    COMMAND MAP
@@ -101,42 +98,66 @@ async function processQueue() {
   if (busy || queue.length === 0) return;
   busy = true;
 
-  const { chatId, userId, take, type } = queue.shift();
-  const { col, label } = COMMANDS[type];
+  const job = queue.shift();
+  const { chatId, userId, perFile, fileCount, type } = job;
+
+  const cmd = COMMANDS[type];
+  if (!cmd) {
+    busy = false;
+    return processQueue();
+  }
+
+  const { col, label } = cmd;
 
   try {
-    await bot.sendMessage(chatId, "✅ Udah di kirim lewat japri eaak...");
+    await bot.sendMessage(chatId, "📥 Sebentar, otw kirim...");
 
-    // WAJIB TEST DM
+    // WAJIB: user harus pernah /start biar bot bisa japri
     await bot.sendMessage(userId, "⏳ Sebentar beb...");
 
+    const totalNeed = perFile * fileCount;
+
+    // GET numbers from sheet
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_NAME}!${col}:${col}`,
     });
 
     const numbers = (res.data.values || [])
-      .map(v => String(v[0]).replace(/\D/g, ""))
-      .filter(v => v.length >= 10);
+      .map((v) => String(v?.[0] ?? "").replace(/\D/g, ""))
+      .filter((v) => v.length >= 10);
 
-    if (numbers.length < take) {
-      await bot.sendMessage(chatId, "❌ Stok tidak cukup");
+    if (numbers.length < totalNeed) {
+      await bot.sendMessage(
+        chatId,
+        `❌ Stok tidak cukup.\nButuh: ${totalNeed}\nTersedia: ${numbers.length}`
+      );
       busy = false;
       return processQueue();
     }
 
-    const selected = numbers.slice(0, take);
-    const remain = numbers.slice(take);
-    const files = chunk(selected, 5);
+    // TAKE totalNeed numbers, then split by perFile into fileCount files
+    const selectedAll = numbers.slice(0, totalNeed);
+    const remain = numbers.slice(totalNeed);
 
-    for (let i = 0; i < files.length; i++) {
-      const vcardText = files[i].map(
-        (n, x) => `BEGIN:VCARD
+    const files = splitBySize(selectedAll, perFile); // harusnya panjang = fileCount
+    // keamanan: kalau karena bug jadi lebih, potong aja
+    const filesToSend = files.slice(0, fileCount);
+
+    // kirim file
+    let globalCounter = 1;
+    for (let i = 0; i < filesToSend.length; i++) {
+      const chunkNums = filesToSend[i];
+
+      const vcardText = chunkNums
+        .map(
+          (n) => `BEGIN:VCARD
 VERSION:3.0
-FN:${label}-${x + 1}
+FN:${label}-${globalCounter++}
 TEL;TYPE=CELL:${n}
 END:VCARD`
-      ).join("\n");
+        )
+        .join("\n");
 
       const buffer = Buffer.from(vcardText, "utf8");
 
@@ -153,7 +174,7 @@ END:VCARD`
       await sleep(1200);
     }
 
-    // UPDATE SHEET
+    // UPDATE SHEET (hapus kolom, lalu isi sisa)
     await sheets.spreadsheets.values.clear({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_NAME}!${col}:${col}`,
@@ -165,16 +186,21 @@ END:VCARD`
         range: `${SHEET_NAME}!${col}1`,
         valueInputOption: "RAW",
         requestBody: {
-          values: remain.map(v => [v]),
+          values: remain.map((v) => [v]),
         },
       });
     }
 
-    await bot.sendMessage(userId, "✅ VCARD udah dikirim semua eakkk");
-
+    await bot.sendMessage(
+      userId,
+      `✅ Selesai.\nDikirim: ${fileCount} file\nIsi per file: ${perFile}\nTotal: ${totalNeed}`
+    );
   } catch (e) {
     console.error("❌ ERROR:", e);
-    await bot.sendMessage(chatId, "❌ Gagal kirim file. Pastikan kamu sudah /start bot.");
+    await bot.sendMessage(
+      chatId,
+      "❌ Gagal kirim file. Pastikan kamu sudah /start bot dulu (biar bot bisa japri)."
+    );
   }
 
   busy = false;
@@ -184,30 +210,46 @@ END:VCARD`
 /* =======================
    MESSAGE HANDLER
 ======================= */
-bot.on("message", msg => {
+bot.on("message", (msg) => {
   if (!msg.text) return;
 
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
   if (msg.text === "/start") {
-    bot.sendMessage(chatId, "✅ Bot aktif. Gunakan:\n#vcardfresh JUMLAH\n#vcardfu JUMLAH");
+    bot.sendMessage(
+      chatId,
+      "✅ Bot aktif.\n\nFormat:\n#vcardfresh JUMLAH_PER_FILE JUMLAH_FILE\n#vcardfu JUMLAH_PER_FILE JUMLAH_FILE\n\nContoh:\n#vcardfresh 500 3\n(= kirim 3 file, masing-masing isi 500 nomor)"
+    );
     return;
   }
 
-  const m = msg.text.match(/^#(vcardfresh|vcardfu)\s+(\d+)/i);
+  // format: #vcardfresh 500 3
+  const m = msg.text.match(/^#(vcardfresh|vcardfu)\s+(\d+)\s+(\d+)$/i);
   if (!m) return;
 
-  queue.push({
-    chatId,
-    userId,
-    type: m[1].toLowerCase(),
-    take: parseInt(m[2], 10),
-  });
+  const type = m[1].toLowerCase();
+  const perFile = parseInt(m[2], 10);
+  const fileCount = parseInt(m[3], 10);
 
-  bot.sendMessage(chatId, "📥 Cek japri ea");
+  if (!Number.isFinite(perFile) || perFile <= 0) {
+    bot.sendMessage(chatId, "❌ JUMLAH_PER_FILE harus angka > 0");
+    return;
+  }
+  if (!Number.isFinite(fileCount) || fileCount <= 0) {
+    bot.sendMessage(chatId, "❌ JUMLAH_FILE harus angka > 0");
+    return;
+  }
+
+  // optional safety limit biar gak kebangetan (ubah sesuai kebutuhan)
+  const total = perFile * fileCount;
+  if (total > 50000) {
+    bot.sendMessage(chatId, "❌ Kebanyakan. Turunin jumlahnya dulu.");
+    return;
+  }
+
+  queue.push({ chatId, userId, type, perFile, fileCount });
   processQueue();
 });
 
 console.log("🤖 BOT FINAL FIX — FILE PASTI TERKIRIM");
-
